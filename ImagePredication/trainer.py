@@ -54,10 +54,20 @@ import os
 import shutil
 import random
 import threading
+import sys
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import save_file, load_file
+
+# ── Path setup ─────────────────────────────────────────────────────────────────
+# trainer.py is in ImagePredication/ — hardware.py is in the parent folder
+_HERE       = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_HERE)
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 import hardware
 import feedback_store

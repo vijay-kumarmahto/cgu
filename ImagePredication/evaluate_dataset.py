@@ -21,8 +21,20 @@ Outputs
 import os
 import csv
 import time
+import sys
 from PIL import Image
 from tqdm import tqdm
+
+# ── Path setup ─────────────────────────────────────────────────────────────────
+# evaluate_dataset.py is in ImagePredication/
+# hardware.py is in the parent (DeepFake_Predication/)
+# ensemble.py is in the same folder
+_HERE       = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_HERE)
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 # ── Hardware setup: suppress noise, configure torch, then load the rest ────────
 import hardware

@@ -9,10 +9,13 @@ dist/
 build/
 .eggs/
 .env
-.venv
+.venv/
 venv/
 env/
 *.pyc
+
+# Virtual environment (explicit)
+.venv
 
 # Model snapshots & weights
 models/

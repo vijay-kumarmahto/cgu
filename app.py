@@ -16,6 +16,19 @@ Shows:
 import os
 import queue
 import threading
+import sys
+
+# ── Path setup ─────────────────────────────────────────────────────────────────
+# app.py lives in DeepFake_Predication/
+# hardware.py is in the same folder → already on path when run from here
+# ensemble, models, trainer, feedback_store live in ImagePredication/
+_BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+_IMAGE_DIR = os.path.join(_BASE_DIR, "ImagePredication")
+if _IMAGE_DIR not in sys.path:
+    sys.path.insert(0, _IMAGE_DIR)
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
+
 import hardware
 
 hardware.configure()

@@ -1,0 +1,9 @@
+{
+  "pythonVersion": "3.12",
+  "extraPaths": [
+    ".",
+    "ImagePredication"
+  ],
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none"
+}

@@ -113,9 +113,11 @@ REQUIRED_MODEL_FILES = [
     "preprocessor_config.json",
 ]
 
+IMAGE_DIR = os.path.join(BASE_DIR, "ImagePredication")
+
 MODEL_DIRS = {
-    "ViT":    os.path.join(BASE_DIR, "models", "vit"),
-    "SigLIP": os.path.join(BASE_DIR, "models", "siglip"),
+    "ViT":    os.path.join(IMAGE_DIR, "models", "vit"),
+    "SigLIP": os.path.join(IMAGE_DIR, "models", "siglip"),
 }
 
 def check_models() -> bool:
@@ -177,7 +179,7 @@ if __name__ == "__main__":
     # ── Check new feedback/trainer files are present ───────────────────────────
     new_files_ok = True
     for fname in ["feedback_store.py", "trainer.py"]:
-        fpath = os.path.join(BASE_DIR, fname)
+        fpath = os.path.join(IMAGE_DIR, fname)
         if not os.path.isfile(fpath):
             print(f"  ❌  Missing required file: {fname}")
             new_files_ok = False
