@@ -6,18 +6,26 @@ Fine-tunes both ViT and SigLIP classifier heads on user feedback.
 Strategy (prevents overfitting AND underfitting)
 -------------------------------------------------
   1. Head-only training  — backbone frozen, only classifier layer updated
-  2. Small LR            — 1e-5 (nudge, not a jump)
-  3. 3–5 steps           — stop early if loss plateaus
+  2. Adaptive LR/steps   — scales with replay buffer size (more data = more training)
+  3. Early stop          — stop if loss plateaus below threshold
   4. Mini-batch          — new image + samples from replay buffer (mixed)
   5. L2 anchor           — penalty toward original weights (prevents drift)
   6. Both models updated — ViT and SigLIP always trained together
+
+Persistence
+-----------
+  After each fine-tune, the updated state_dict is saved directly back to
+  models/vit/model.safetensors and models/siglip/model.safetensors.
+  Write is atomic: write to .tmp → os.replace() so a crash never corrupts.
+  A backup (model_backup.safetensors) is kept before each overwrite so
+  drift rollback can restore the prior good weights.
 
 Note: INT8 quantization removed — torchao quantized tensors do not support
 autograd. Models stay float32 throughout (inference + training).
 
 Label conventions (same as models.py normalized output)
 ---------------------------------------------------------
-  "Fake" → class index 1 for ViT   (ViT raw: 0=Real, 1=Fake)
+  "Fake" → class index 1 for ViT    (ViT raw:    0=Real, 1=Fake)
   "Fake" → class index 0 for SigLIP (SigLIP raw: 0=Fake, 1=Real)
 
 Drift detection
@@ -25,74 +33,68 @@ Drift detection
   Every DRIFT_CHECK_EVERY corrections, run_drift_check() is called
   automatically from train_on_correction(). It tests both models on a
   fixed small validation set (feedback/val_set/ — 20 images, 10F+10R).
-  If accuracy drops > DRIFT_TOLERANCE from baseline → auto-rollback.
+  If accuracy drops > DRIFT_TOLERANCE from baseline → auto-rollback from backup.
 
 Public API
 ----------
   train_on_correction(image, correct_label)
-      → builds batch, fine-tunes both models, saves, checks drift
-      → returns {"vit_steps": int, "siglip_steps": int, "drift_check": bool}
+      → builds batch, fine-tunes both models, saves atomically, checks drift
+      → returns {"vit_steps": int, "siglip_steps": int,
+                  "drift_check": bool, "rollback": bool}
 
   set_models(vit_model, vit_processor, siglip_model, siglip_processor)
       → called by models.py after loading — injects live model references
 
-  restore_last_checkpoint()
-      → loads last saved weights for both models from feedback/checkpoints/
+  restore_from_backup()
+      → loads model_backup.safetensors back into both live models
+      → used by drift rollback; returns True on success
 """
 
 import os
+import shutil
 import random
 import threading
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from safetensors.torch import save_file, load_file
 
 import hardware
 import feedback_store
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-LR                 = 1e-4    # learning rate — increased from 1e-5 for stronger correction signal
-MAX_STEPS          = 5       # max gradient steps per correction
-MIN_STEPS          = 3       # always do at least this many steps
-EARLY_STOP_LOSS    = 0.05    # stop early if loss drops below this (well learned)
-REPLAY_BATCH_SIZE  = 6       # how many replay buffer samples to mix in
-L2_LAMBDA          = 0.001   # L2 anchor strength — reduced from 0.01 so corrections stick
-DRIFT_CHECK_EVERY  = 10      # run drift check every N corrections
-DRIFT_TOLERANCE    = 0.07    # if accuracy drops more than 7% → rollback
-MAX_CHECKPOINTS    = 3       # keep only this many checkpoint files per model
-
 # ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_DIR  = os.path.join(BASE_DIR, "feedback", "checkpoints")
-VAL_DIR         = os.path.join(BASE_DIR, "feedback", "val_set")   # optional
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
+VIT_MODEL_PATH    = os.path.join(BASE_DIR, "models", "vit",    "model.safetensors")
+SIGLIP_MODEL_PATH = os.path.join(BASE_DIR, "models", "siglip", "model.safetensors")
+VAL_DIR           = os.path.join(BASE_DIR, "feedback", "val_set")
+
+# ── Training config ────────────────────────────────────────────────────────────
+EARLY_STOP_LOSS   = 0.05
+REPLAY_BATCH_SIZE = 6
+L2_LAMBDA         = 0.001
+DRIFT_CHECK_EVERY = 10
+DRIFT_TOLERANCE   = 0.07
 
 # ── Model references (injected by models.py via set_models()) ──────────────────
-_vit_model       = None
-_vit_processor   = None
-_siglip_model    = None
+_vit_model        = None
+_vit_processor    = None
+_siglip_model     = None
 _siglip_processor = None
 
-# ── Original weights snapshot (taken once at set_models() time) ───────────────
-# Used for L2 anchor regularization — keeps fine-tuned weights close to original
-_vit_original_head    = None   # clone of original ViT classifier weights
-_siglip_original_head = None   # clone of original SigLIP classifier weights
+# ── Original weights snapshot ─────────────────────────────────────────────────
+_vit_original_head    = None
+_siglip_original_head = None
 
-# ── Baseline accuracy (set after first drift check) ───────────────────────────
+# ── Baseline accuracy ─────────────────────────────────────────────────────────
 _baseline_vit_acc    = None
 _baseline_siglip_acc = None
 
-# ── Thread lock — prevents two fine-tune calls overlapping ────────────────────
+# ── Thread lock ────────────────────────────────────────────────────────────────
 _train_lock = threading.Lock()
 
 
-# ── Injection (called by models.py) ───────────────────────────────────────────
+# ── Injection ─────────────────────────────────────────────────────────────────
 def set_models(vit_model, vit_processor, siglip_model, siglip_processor) -> None:
-    """
-    Inject live model + processor references.
-    Called once by models.py after loading.
-    Snapshots original classifier head weights (plain float32) for L2 anchoring.
-    """
     global _vit_model, _vit_processor, _siglip_model, _siglip_processor
     global _vit_original_head, _siglip_original_head
 
@@ -101,8 +103,7 @@ def set_models(vit_model, vit_processor, siglip_model, siglip_processor) -> None
     _siglip_model     = siglip_model
     _siglip_processor = siglip_processor
 
-    # Models are plain float32 — snapshot classifier heads directly
-    def _snapshot_head(model: torch.nn.Module) -> dict:
+    def _snapshot_head(model):
         return {
             name: param.data.float().clone().detach()
             for name, param in model.named_parameters()
@@ -117,29 +118,21 @@ def set_models(vit_model, vit_processor, siglip_model, siglip_processor) -> None
 
 # ── Label → class index ────────────────────────────────────────────────────────
 def _vit_label_index(label: str) -> int:
-    """ViT raw labels: 0=Real, 1=Fake"""
     return 1 if label == "Fake" else 0
 
 
 def _siglip_label_index(label: str) -> int:
-    """SigLIP raw labels: 0=Fake, 1=Real"""
     return 0 if label == "Fake" else 1
 
 
-# ── Freeze backbone, unfreeze only classifier head ────────────────────────────
+# ── Freeze backbone ───────────────────────────────────────────────────────────
 def _set_head_only(model: torch.nn.Module) -> None:
-    """Freeze all parameters except the final classifier layer."""
     for name, param in model.named_parameters():
         param.requires_grad = "classifier" in name
 
 
 # ── L2 anchor loss ─────────────────────────────────────────────────────────────
 def _l2_anchor_loss(model: torch.nn.Module, original_head: dict) -> torch.Tensor:
-    """
-    Penalizes deviation of current classifier weights from original weights.
-    Loss = L2_LAMBDA * sum(||current - original||^2) for each classifier param.
-    Both sides are plain float32 — no quantization involved.
-    """
     loss = torch.tensor(0.0)
     for name, param in model.named_parameters():
         if name in original_head:
@@ -148,17 +141,99 @@ def _l2_anchor_loss(model: torch.nn.Module, original_head: dict) -> torch.Tensor
     return L2_LAMBDA * loss
 
 
-# ── Build training batch ───────────────────────────────────────────────────────
+# ── Adaptive training params ───────────────────────────────────────────────────
+def _get_training_params(buffer_size: int) -> dict:
+    """
+    Scale training intensity with replay buffer size.
+      0       → only 1 new image; minimal update
+      1–3     → small sample; cautious
+      4–9     → reasonable sample; normal
+      10+     → full sample; standard
+    """
+    if buffer_size == 0:
+        return {"max_steps": 2, "min_steps": 1, "lr": 5e-5,
+                "note": "no replay buffer — minimal update"}
+    elif buffer_size <= 3:
+        return {"max_steps": 3, "min_steps": 2, "lr": 7e-5,
+                "note": f"small buffer ({buffer_size}) — cautious update"}
+    elif buffer_size <= 9:
+        return {"max_steps": 4, "min_steps": 3, "lr": 1e-4, "note": None}
+    else:
+        return {"max_steps": 5, "min_steps": 3, "lr": 1e-4, "note": None}
+
+
+# ── Build batch ────────────────────────────────────────────────────────────────
 def _build_batch(new_image: Image.Image, correct_label: str) -> list[dict]:
-    """
-    Combine the new correction with samples from the replay buffer.
-    Returns list of {"image": PIL.Image, "label": str} dicts.
-    """
-    batch = [{"image": new_image, "label": correct_label}]
+    batch  = [{"image": new_image, "label": correct_label}]
     replay = feedback_store.get_replay_batch(REPLAY_BATCH_SIZE)
     batch.extend(replay)
-    random.shuffle(batch)   # mix order so model doesn't learn position bias
+    random.shuffle(batch)
     return batch
+
+
+# ── Atomic model save with backup ─────────────────────────────────────────────
+def _save_model_atomic(model: torch.nn.Module, model_path: str, model_name: str) -> None:
+    """
+    1. Backup current model_path → model_backup.safetensors
+    2. Write new weights → model_path.tmp
+    3. os.replace(tmp → model_path)  ← atomic on Linux
+    On failure: cleanup .tmp, re-raise.
+    """
+    backup_path = model_path.replace("model.safetensors", "model_backup.safetensors")
+    tmp_path    = model_path + ".tmp"
+
+    try:
+        if os.path.isfile(model_path):
+            shutil.copy2(model_path, backup_path)
+
+        state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        save_file(state, tmp_path)
+        os.replace(tmp_path, model_path)
+
+        print(f"[trainer] {model_name}: saved → {os.path.basename(model_path)}", flush=True)
+
+    except Exception as exc:
+        if os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise RuntimeError(f"[trainer] {model_name}: save failed — {exc}") from exc
+
+
+# ── Restore from backup ────────────────────────────────────────────────────────
+def restore_from_backup() -> bool:
+    """
+    Load model_backup.safetensors into both live models.
+    Called automatically on drift detection.
+    Returns True if both restored successfully.
+    """
+    if _vit_model is None or _siglip_model is None:
+        print("[trainer] Models not set — cannot restore.", flush=True)
+        return False
+
+    success = True
+    pairs = [
+        (_vit_model,    VIT_MODEL_PATH,    "vit"),
+        (_siglip_model, SIGLIP_MODEL_PATH, "siglip"),
+    ]
+
+    for model, model_path, name in pairs:
+        backup_path = model_path.replace("model.safetensors", "model_backup.safetensors")
+        if not os.path.isfile(backup_path):
+            print(f"[trainer] {name}: no backup at {backup_path}", flush=True)
+            success = False
+            continue
+        try:
+            state = load_file(backup_path, device=str(hardware.DEVICE))
+            model.load_state_dict(state)
+            model.eval()
+            print(f"[trainer] {name}: restored from backup", flush=True)
+        except Exception as exc:
+            print(f"[trainer] {name}: restore failed — {exc}", flush=True)
+            success = False
+
+    return success
 
 
 # ── Single model fine-tune ─────────────────────────────────────────────────────
@@ -167,42 +242,40 @@ def _fine_tune(
     processor,
     original_head: dict,
     batch: list[dict],
-    label_fn,            # callable: label str → class index int
+    label_fn,
     model_name: str,
+    lr: float,
+    max_steps: int,
+    min_steps: int,
 ) -> int:
-    """
-    Fine-tune a single model's classifier head on the given batch.
-
-    Returns the number of gradient steps actually taken.
-    """
+    """Fine-tune classifier head. Returns steps taken."""
     _set_head_only(model)
     model.train()
 
-    # Only optimize classifier parameters (all others are frozen)
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
-        print(f"[trainer] {model_name}: no trainable params found — skipping.", flush=True)
+        print(f"[trainer] {model_name}: no trainable params — skipping.", flush=True)
         return 0
 
-    optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
 
     steps_done = 0
-    for step in range(MAX_STEPS):
+    loss_val   = 0.0
+
+    for step in range(max_steps):
         total_loss = torch.tensor(0.0)
 
         for item in batch:
-            img   = item["image"].convert("RGB")
-            label = item["label"]
-
+            img    = item["image"].convert("RGB")
+            label  = item["label"]
             inputs = processor(images=img, return_tensors="pt")
             inputs = {k: v.to(hardware.DEVICE) for k, v in inputs.items()}
             target = torch.tensor([label_fn(label)], dtype=torch.long).to(hardware.DEVICE)
 
-            logits = model(**inputs).logits            # [1, num_classes]
-            ce_loss = F.cross_entropy(logits.float(), target)
+            logits     = model(**inputs).logits
+            ce_loss    = F.cross_entropy(logits.float(), target)
             total_loss = total_loss + ce_loss
 
-        # Add L2 anchor regularization
         total_loss = total_loss + _l2_anchor_loss(model, original_head)
 
         optimizer.zero_grad()
@@ -210,10 +283,14 @@ def _fine_tune(
         optimizer.step()
 
         steps_done += 1
-        loss_val = total_loss.item()
+        loss_val    = total_loss.item()
 
-        # Early stop: loss is already very low — no point continuing
-        if step >= MIN_STEPS - 1 and loss_val < EARLY_STOP_LOSS:
+        print(
+            f"[trainer] {model_name}: step {step+1}/{max_steps}  loss={loss_val:.4f}",
+            flush=True,
+        )
+
+        if step >= min_steps - 1 and loss_val < EARLY_STOP_LOSS:
             print(
                 f"[trainer] {model_name}: early stop at step {step+1} "
                 f"(loss={loss_val:.4f} < {EARLY_STOP_LOSS})",
@@ -223,76 +300,17 @@ def _fine_tune(
 
     model.eval()
     print(
-        f"[trainer] {model_name}: {steps_done} steps done, "
-        f"final loss={loss_val:.4f}",
+        f"[trainer] {model_name}: done — {steps_done} step(s), final loss={loss_val:.4f}",
         flush=True,
     )
     return steps_done
 
 
-# ── Checkpoint helpers ─────────────────────────────────────────────────────────
-def _save_checkpoint(model: torch.nn.Module, model_name: str) -> None:
-    """
-    Save current model weights as a numbered checkpoint.
-    Deletes oldest checkpoints beyond MAX_CHECKPOINTS.
-    """
-    # Find next checkpoint index
-    existing = sorted([
-        f for f in os.listdir(CHECKPOINT_DIR)
-        if f.startswith(f"{model_name}_ckpt_") and f.endswith(".pt")
-    ])
-    next_idx = len(existing) + 1
-    fname    = f"{model_name}_ckpt_{next_idx:04d}.pt"
-    fpath    = os.path.join(CHECKPOINT_DIR, fname)
-
-    # Save only state_dict (weights), not full model
-    torch.save(model.state_dict(), fpath)
-    print(f"[trainer] Saved checkpoint: {fname}", flush=True)
-
-    # Prune old checkpoints beyond MAX_CHECKPOINTS
-    all_ckpts = sorted([
-        f for f in os.listdir(CHECKPOINT_DIR)
-        if f.startswith(f"{model_name}_ckpt_") and f.endswith(".pt")
-    ])
-    while len(all_ckpts) > MAX_CHECKPOINTS:
-        old = os.path.join(CHECKPOINT_DIR, all_ckpts.pop(0))
-        os.remove(old)
-        print(f"[trainer] Removed old checkpoint: {os.path.basename(old)}", flush=True)
-
-
-def restore_last_checkpoint() -> bool:
-    """
-    Restore both models to their most recent saved checkpoints.
-    Returns True if both restored successfully, False otherwise.
-    """
-    if _vit_model is None or _siglip_model is None:
-        print("[trainer] Models not set — cannot restore.", flush=True)
-        return False
-
-    success = True
-    for model, name in [(_vit_model, "vit"), (_siglip_model, "siglip")]:
-        ckpts = sorted([
-            f for f in os.listdir(CHECKPOINT_DIR)
-            if f.startswith(f"{name}_ckpt_") and f.endswith(".pt")
-        ])
-        if not ckpts:
-            print(f"[trainer] No checkpoint found for {name}.", flush=True)
-            success = False
-            continue
-        path = os.path.join(CHECKPOINT_DIR, ckpts[-1])
-        model.load_state_dict(torch.load(path, map_location=hardware.DEVICE))
-        model.eval()
-        print(f"[trainer] Restored {name} from: {ckpts[-1]}", flush=True)
-
-    return success
-
-
 # ── Drift detection ────────────────────────────────────────────────────────────
-def _eval_val_set() -> tuple[float, float]:
+def _eval_val_set() -> tuple:
     """
-    Run both models on feedback/val_set/Fake/ and feedback/val_set/Real/.
-    Returns (vit_accuracy, siglip_accuracy) as 0.0–1.0 floats.
-    Returns (-1.0, -1.0) if val_set doesn't exist or has no images.
+    Returns (vit_accuracy, siglip_accuracy) on val_set.
+    Returns (-1.0, -1.0) if val_set absent or empty.
     """
     fake_dir = os.path.join(VAL_DIR, "Fake")
     real_dir = os.path.join(VAL_DIR, "Real")
@@ -314,9 +332,9 @@ def _eval_val_set() -> tuple[float, float]:
     vit_correct = siglip_correct = 0
     for img_path, gt in items:
         try:
-            img = Image.open(img_path).convert("RGB")
-            vf, vr     = predict_vit(img)
-            sf, sr     = predict_siglip(img)
+            img         = Image.open(img_path).convert("RGB")
+            vf, vr      = predict_vit(img)
+            sf, sr      = predict_siglip(img)
             vit_pred    = "Fake" if vf > vr else "Real"
             siglip_pred = "Fake" if sf > sr else "Real"
             if vit_pred    == gt: vit_correct    += 1
@@ -331,25 +349,20 @@ def _eval_val_set() -> tuple[float, float]:
 def run_drift_check() -> dict:
     """
     Compare current accuracy to baseline.
-    If either model dropped > DRIFT_TOLERANCE → auto-rollback both.
-
-    Returns {"triggered": bool, "vit_acc": float, "siglip_acc": float}
+    If either model dropped > DRIFT_TOLERANCE → rollback from backup.
     """
     global _baseline_vit_acc, _baseline_siglip_acc
 
     vit_acc, siglip_acc = _eval_val_set()
 
     if vit_acc < 0:
-        # No val set — skip silently
         return {"triggered": False, "vit_acc": -1.0, "siglip_acc": -1.0}
 
-    # Set baseline on first check
     if _baseline_vit_acc is None:
         _baseline_vit_acc    = vit_acc
         _baseline_siglip_acc = siglip_acc
         print(
-            f"[trainer] Drift baseline set — "
-            f"ViT={vit_acc:.2%}, SigLIP={siglip_acc:.2%}",
+            f"[trainer] Drift baseline — ViT={vit_acc:.2%}  SigLIP={siglip_acc:.2%}",
             flush=True,
         )
         return {"triggered": False, "vit_acc": vit_acc, "siglip_acc": siglip_acc}
@@ -359,14 +372,14 @@ def run_drift_check() -> dict:
 
     print(
         f"[trainer] Drift check — "
-        f"ViT: {vit_acc:.2%} (drop={vit_drop:.2%}) | "
-        f"SigLIP: {siglip_acc:.2%} (drop={siglip_drop:.2%})",
+        f"ViT: {vit_acc:.2%} (Δ={vit_drop:+.2%}) | "
+        f"SigLIP: {siglip_acc:.2%} (Δ={siglip_drop:+.2%})",
         flush=True,
     )
 
     if vit_drop > DRIFT_TOLERANCE or siglip_drop > DRIFT_TOLERANCE:
-        print("[trainer] ⚠️  Drift detected — rolling back both models.", flush=True)
-        restore_last_checkpoint()
+        print("[trainer] ⚠️  Drift detected — rolling back from backup.", flush=True)
+        restore_from_backup()
         return {"triggered": True, "vit_acc": vit_acc, "siglip_acc": siglip_acc}
 
     return {"triggered": False, "vit_acc": vit_acc, "siglip_acc": siglip_acc}
@@ -380,33 +393,34 @@ def train_on_correction(image: Image.Image, correct_label: str) -> dict:
     Parameters
     ----------
     image         : PIL image that was predicted wrongly
-    correct_label : the true label ("Fake" or "Real") — already flipped by feedback_store
+    correct_label : the true label — already flipped by feedback_store
 
     Returns
     -------
-    {
-        "vit_steps":    int,
-        "siglip_steps": int,
-        "drift_check":  bool,   # True if drift check was run this round
-        "rollback":     bool,   # True if rollback was triggered
-    }
+    {"vit_steps": int, "siglip_steps": int, "drift_check": bool, "rollback": bool}
     """
     if _vit_model is None or _siglip_model is None:
         print("[trainer] Models not injected — call set_models() first.", flush=True)
         return {"vit_steps": 0, "siglip_steps": 0, "drift_check": False, "rollback": False}
 
     with _train_lock:
-        # ── Build shared batch ─────────────────────────────────────────────────
-        batch = _build_batch(image, correct_label)
-        n     = feedback_store.correction_count()
+        # Buffer size AFTER this correction was already added by record_correction
+        buf_size     = feedback_store.buffer_size()
+        train_params = _get_training_params(max(0, buf_size - 1))
+        n            = feedback_store.correction_count()
+        note_str     = f"  [{train_params['note']}]" if train_params["note"] else ""
 
         print(
-            f"[trainer] Starting fine-tune — correction #{n}, "
-            f"label={correct_label}, batch_size={len(batch)}",
+            f"[trainer] ── Correction #{n} ──  label={correct_label}  "
+            f"buffer={buf_size}  lr={train_params['lr']:.0e}  "
+            f"steps={train_params['min_steps']}–{train_params['max_steps']}"
+            f"{note_str}",
             flush=True,
         )
 
-        # ── Fine-tune ViT ──────────────────────────────────────────────────────
+        batch = _build_batch(image, correct_label)
+        print(f"[trainer] Batch: {len(batch)} image(s)", flush=True)
+
         vit_steps = _fine_tune(
             model         = _vit_model,
             processor     = _vit_processor,
@@ -414,9 +428,11 @@ def train_on_correction(image: Image.Image, correct_label: str) -> dict:
             batch         = batch,
             label_fn      = _vit_label_index,
             model_name    = "vit",
+            lr            = train_params["lr"],
+            max_steps     = train_params["max_steps"],
+            min_steps     = train_params["min_steps"],
         )
 
-        # ── Fine-tune SigLIP ───────────────────────────────────────────────────
         siglip_steps = _fine_tune(
             model         = _siglip_model,
             processor     = _siglip_processor,
@@ -424,13 +440,19 @@ def train_on_correction(image: Image.Image, correct_label: str) -> dict:
             batch         = batch,
             label_fn      = _siglip_label_index,
             model_name    = "siglip",
+            lr            = train_params["lr"],
+            max_steps     = train_params["max_steps"],
+            min_steps     = train_params["min_steps"],
         )
 
-        # ── Save checkpoints ───────────────────────────────────────────────────
-        _save_checkpoint(_vit_model,    "vit")
-        _save_checkpoint(_siglip_model, "siglip")
+        # Atomic save — backup existing, write .tmp, os.replace
+        try:
+            _save_model_atomic(_vit_model,    VIT_MODEL_PATH,    "vit")
+            _save_model_atomic(_siglip_model, SIGLIP_MODEL_PATH, "siglip")
+        except RuntimeError as exc:
+            print(f"[trainer] ⚠️  Save error: {exc}", flush=True)
 
-        # ── Drift check every N corrections ───────────────────────────────────
+        # Drift check every N corrections
         drift_result = {"triggered": False, "vit_acc": -1.0, "siglip_acc": -1.0}
         ran_drift    = False
 
@@ -439,7 +461,7 @@ def train_on_correction(image: Image.Image, correct_label: str) -> dict:
             drift_result = run_drift_check()
 
         print(
-            f"[trainer] Done — ViT:{vit_steps} steps, SigLIP:{siglip_steps} steps",
+            f"[trainer] ── Done ──  ViT: {vit_steps} step(s)  SigLIP: {siglip_steps} step(s)",
             flush=True,
         )
 

@@ -18,9 +18,6 @@ import queue
 import threading
 import hardware
 
-# Suppress torchao C-level .so noise before any torchao import.
-# Must be the very first torchao-touching call in this entry point.
-hardware.suppress_torchao_noise()
 hardware.configure()
 hardware.summary()
 
@@ -169,11 +166,11 @@ def check_training_status():
 
     if rollback:
         return (
-            f"⚠️ **Drift detected — models rolled back to last good checkpoint.**\n\n"
+            f"⚠️ **Drift detected — models rolled back to previous backup.**\n\n"
             f"- ViT steps taken : {vit_steps}\n"
             f"- SigLIP steps taken: {siglip_steps}\n"
             f"- Recent corrections caused accuracy drop > threshold.\n"
-            f"- Both models restored. Keep providing feedback to improve them."
+            f"- Both models restored from backup. Keep providing feedback to improve them."
         )
 
     drift_note = (
@@ -183,7 +180,7 @@ def check_training_status():
     )
 
     return (
-        f"✅ **Both models updated successfully.**\n\n"
+        f"✅ **Both models updated and saved.**\n\n"
         f"- ViT  : {vit_steps} gradient step(s)\n"
         f"- SigLIP: {siglip_steps} gradient step(s)"
         f"{drift_note}"

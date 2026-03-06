@@ -17,13 +17,11 @@ Exports
   DEVICE       : torch.device to use
   DTYPE        : torch.float16 | torch.bfloat16 | torch.float32
   PROFILE      : "cuda" | "openvino" | "cpu_avx2" | "cpu_basic"
-  OV_DEVICE    : "GPU" | "CPU" | None  (OpenVINO only)
   configure()  : call once at startup — sets all torch globals
   summary()    : prints a hardware summary table
 """
 
 import os
-import subprocess
 import torch
 import psutil
 
@@ -111,7 +109,6 @@ def _detect_cpu() -> dict:
         "e_cores":    e_cores,
         "avx2":       "avx2"     in flags,
         "avx_vnni":   "avx_vnni" in flags,
-        "avx512":     "avx512f"  in flags,
         "mkl":        torch.backends.mkl.is_available(),
         "mkldnn":     torch.backends.mkldnn.is_available(),
         "ram_gb":     ram_gb,
@@ -177,12 +174,6 @@ def _apply_torch_settings(profile: str, cpu: dict) -> dict:
         if cpu["mkldnn"]:
             torch.backends.mkldnn.enabled = True
 
-        # Enable memory-efficient attention if available
-        try:
-            torch.backends.cuda.enable_mem_efficient_sdp(False)  # CPU path
-        except Exception:
-            pass
-
         settings["num_threads"]       = num_threads
         settings["interop_threads"]   = interop
         settings["mkldnn"]            = cpu["mkldnn"]
@@ -196,7 +187,6 @@ _ov   = _detect_openvino()
 _cpu  = _detect_cpu()
 
 PROFILE, DEVICE, DTYPE = _build_profile(_cuda, _ov, _cpu)
-OV_DEVICE = "GPU" if PROFILE == "openvino" else None
 
 _SETTINGS = {}   # filled by configure()
 _configured = False
