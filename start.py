@@ -80,29 +80,52 @@ def kill_existing() -> None:
 
 
 # ── 2. Dependency check ────────────────────────────────────────────────────────
-REQUIRED_PACKAGES = {
-    "torch":           "torch>=2.0.0",
-    "torchvision":     "torchvision>=0.15.0",
-    "torchao":         "torchao>=0.16.0",
-    "transformers":    "transformers>=4.38.0",
-    "PIL":             "Pillow>=10.0.0",
-    "gradio":          "gradio>=4.0.0",
-    "tqdm":            "tqdm>=4.65.0",
-    "accelerate":      "accelerate>=0.20.0",
-    "psutil":          "psutil>=5.9.0",
-    "safetensors":     "safetensors>=0.4.0",
-    "timm":            "timm>=0.9.0",
-    "decord":          "decord>=0.6.0",
+# Map import names to pip package names (when they differ)
+IMPORT_TO_PIP = {
+    "PIL": "Pillow",
 }
 
-def check_dependencies() -> bool:
-    missing = []
-    for module, pip_name in REQUIRED_PACKAGES.items():
-        try:
-            __import__(module)
-        except ImportError:
-            missing.append(pip_name)
+def parse_requirements() -> list[str]:
+    """Parse requirements.txt and return list of package specs."""
+    req_path = os.path.join(BASE_DIR, "requirements.txt")
+    if not os.path.isfile(req_path):
+        return []
+    
+    packages = []
+    with open(req_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            # Skip empty lines and comments
+            if line and not line.startswith("#"):
+                packages.append(line)
+    return packages
 
+def get_import_name(package_spec: str) -> str:
+    """Extract import name from package spec (e.g., 'torch>=2.0.0' -> 'torch')."""
+    # Remove version specifiers
+    for sep in [">", "<", "=", "!", "~"]:
+        if sep in package_spec:
+            package_spec = package_spec.split(sep)[0]
+    return package_spec.strip()
+
+def check_dependencies() -> bool:
+    packages = parse_requirements()
+    if not packages:
+        print("  ⚠️  requirements.txt not found or empty")
+        return True  # Don't block if file missing
+    
+    missing = []
+    for pkg_spec in packages:
+        pip_package = get_import_name(pkg_spec)
+        
+        # Map pip package name to import name (Pillow -> PIL)
+        import_name = "PIL" if pip_package == "Pillow" else pip_package
+        
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg_spec)
+    
     if missing:
         print("=" * 60)
         print("  ❌  Missing packages detected")
@@ -110,7 +133,7 @@ def check_dependencies() -> bool:
         print("\n  Install them with:\n")
         print(f"  pip install {' '.join(missing)}\n")
         return False
-
+    
     print("  ✅  All dependencies present.")
     return True
 
@@ -122,12 +145,14 @@ REQUIRED_MODEL_FILES = [
     "preprocessor_config.json",
 ]
 
-IMAGE_DIR = os.path.join(BASE_DIR, "ImagePredication")
-VIDEO_DIR = os.path.join(BASE_DIR, "VideoPredication")
+IMAGE_DIR = os.path.join(BASE_DIR, "ImageDetection")
+VIDEO_DIR = os.path.join(BASE_DIR, "VideoDetection")
+AUDIO_DIR = os.path.join(BASE_DIR, "AudioDetection")
 
 MODEL_DIRS = {
     "ViT":    os.path.join(IMAGE_DIR, "models", "vit"),
     "SigLIP": os.path.join(IMAGE_DIR, "models", "siglip"),
+    "Audio":  os.path.join(AUDIO_DIR, "models"),
 }
 
 VIDEO_WEIGHTS = {
@@ -158,19 +183,16 @@ def check_models() -> bool:
             for f in REQUIRED_MODEL_FILES:
                 print(f"      └── {f}")
     else:
-        print("  ✅  All image model files present.")
+        print("  ✅  All model files present (Image + Audio).")
     
-    # Check video model weights (optional - warn but don't fail)
-    video_ok = True
+    # Check video model weights (required)
     for name, path in VIDEO_WEIGHTS.items():
         if not os.path.isfile(path):
-            print(f"  ⚠️  {name} weight missing: {path}")
-            video_ok = False
+            print(f"  ❌  {name} weight missing: {path}")
+            all_ok = False
     
-    if video_ok:
+    if all_ok:
         print("  ✅  All video model weights present.")
-    else:
-        print("  ⚠️  Video analysis will be unavailable (weights missing).")
     
     return all_ok
 
@@ -209,17 +231,7 @@ if __name__ == "__main__":
     deps_ok   = check_dependencies()
     models_ok = check_models()
 
-    # ── Check new feedback/trainer files are present ───────────────────────────
-    new_files_ok = True
-    for fname in ["feedback_store.py", "trainer.py"]:
-        fpath = os.path.join(IMAGE_DIR, fname)
-        if not os.path.isfile(fpath):
-            print(f"  ❌  Missing required file: {fname}")
-            new_files_ok = False
-    if new_files_ok:
-        print("  ✅  feedback_store.py and trainer.py present.")
-
-    if not deps_ok or not models_ok or not new_files_ok:
+    if not deps_ok or not models_ok:
         print("\n  ❌  Fix the issues above, then run start.py again.")
         sys.exit(1)
 

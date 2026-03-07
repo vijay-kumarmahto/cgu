@@ -9,7 +9,7 @@ import sys
 # Ensure we import GenConViTDetector from THIS directory's models.py
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Import models.py from VideoPredication using absolute path
+# Import models.py from VideoDetection using absolute path
 import importlib.util
 _models_path = os.path.join(_THIS_DIR, 'models.py')
 _spec = importlib.util.spec_from_file_location('video_models', _models_path)

@@ -61,7 +61,7 @@ from PIL import Image
 from safetensors.torch import save_file, load_file
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
-# trainer.py is in ImagePredication/
+# trainer.py is in ImageDetection/
 _HERE       = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_HERE)
 if _PARENT_DIR not in sys.path:

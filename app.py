@@ -20,14 +20,15 @@ import sys
 import time
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
-# app.py lives in DeepFake_Predication/
-# ImagePredication must be FIRST in path (has models.py for ensemble)
-# VideoPredication added LAST (has different models.py for video)
+# app.py lives in DeepFake_Detection/
+# ImageDetection must be FIRST in path (has models.py for ensemble)
+# VideoDetection added LAST (has different models.py for video)
 _BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-_IMAGE_DIR = os.path.join(_BASE_DIR, "ImagePredication")
-_VIDEO_DIR = os.path.join(_BASE_DIR, "VideoPredication")
+_IMAGE_DIR = os.path.join(_BASE_DIR, "ImageDetection")
+_VIDEO_DIR = os.path.join(_BASE_DIR, "VideoDetection")
+_AUDIO_DIR = os.path.join(_BASE_DIR, "AudioDetection")
 
-# Order matters: ImagePredication first
+# Order matters: ImageDetection first
 if _IMAGE_DIR not in sys.path:
     sys.path.insert(0, _IMAGE_DIR)
 if _BASE_DIR not in sys.path:
@@ -53,6 +54,13 @@ video_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(video_module)
 _video_predict = video_module.predict_video
 
+# Load audio inference
+audio_inference_path = os.path.join(_AUDIO_DIR, "inference.py")
+spec = importlib.util.spec_from_file_location("audio_inference", audio_inference_path)
+audio_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(audio_module)
+_audio_analyze = audio_module.analyze_audio
+
 # Pre-populate replay buffer from previously saved corrections on disk
 feedback_store.load_buffer_from_disk()
 
@@ -66,6 +74,13 @@ _last_video = {
     "path":    None,   # video file path
     "verdict": None,   # "FAKE" or "REAL"
     "score":   None,   # raw score
+}
+
+_last_audio = {
+    "path":    None,   # audio file path
+    "verdict": None,   # "Fake" or "Real"
+    "fake_prob": None,
+    "real_prob": None,
 }
 
 # Queue used to pass training result from background thread → UI poll
@@ -373,7 +388,36 @@ with gr.Blocks(title="Ensemble Deepfake Detector") as demo:
             def analyze_audio(audio_path):
                 if audio_path is None:
                     return "⚠️ No audio uploaded.", {}
-                return "🚧 **Audio analysis coming soon!**\n\nThis feature will analyze voice patterns, spectral features, and artifacts.", {}
+                
+                try:
+                    result = _audio_analyze(audio_path)
+                    
+                    _last_audio["path"] = audio_path
+                    _last_audio["verdict"] = result["verdict"]
+                    _last_audio["fake_prob"] = result["fake_prob"]
+                    _last_audio["real_prob"] = result["real_prob"]
+                    
+                    result_md = f"""## 🎤 Audio Analysis Result
+
+**Verdict:** {result['verdict']}  
+**Confidence:** {result['confidence']*100:.2f}%
+
+**Probabilities:**
+- Fake: {result['fake_prob']*100:.2f}%
+- Real: {result['real_prob']*100:.2f}%
+
+*Analysis using Wav2Vec2 audio deepfake detector.*
+"""
+                    details = {
+                        "verdict": result["verdict"],
+                        "fake_probability": f"{result['fake_prob']:.4f}",
+                        "real_probability": f"{result['real_prob']:.4f}",
+                        "confidence": f"{result['confidence']:.4f}"
+                    }
+                    return result_md, details
+                    
+                except Exception as e:
+                    return f"❌ **Audio analysis failed:** {e}", {}
             
             audio_detect_btn.click(
                 fn=analyze_audio,
@@ -381,20 +425,30 @@ with gr.Blocks(title="Ensemble Deepfake Detector") as demo:
                 outputs=[audio_output, audio_details],
             )
 
+            def audio_feedback_correct():
+                if _last_audio["verdict"] is None:
+                    return "⚠️ No prediction yet — upload and detect first."
+                return f"✅ **Prediction was correct — no training needed.**\n\nVerdict: {_last_audio['verdict']}"
+            
+            def audio_feedback_wrong():
+                if _last_audio["verdict"] is None:
+                    return "⚠️ No prediction yet — upload and detect first."
+                return f"❌ **Wrong prediction recorded.**\n\n⚠️ Audio model fine-tuning not yet implemented.\n\nPredicted: {_last_audio['verdict']}"
+            
             audio_correct_btn.click(
-                fn=lambda: "🚧 **Audio feedback coming soon!**",
+                fn=audio_feedback_correct,
                 inputs=[],
                 outputs=[audio_feedback_status],
             )
 
             audio_wrong_btn.click(
-                fn=lambda: "🚧 **Audio feedback coming soon!**",
+                fn=audio_feedback_wrong,
                 inputs=[],
                 outputs=[audio_feedback_status],
             )
 
             audio_status_btn.click(
-                fn=lambda: "🚧 **Audio feedback coming soon!**",
+                fn=lambda: "⚠️ Audio model training not yet implemented.",
                 inputs=[],
                 outputs=[audio_feedback_status],
             )

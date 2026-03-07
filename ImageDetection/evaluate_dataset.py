@@ -26,8 +26,8 @@ from PIL import Image
 from tqdm import tqdm
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
-# evaluate_dataset.py is in ImagePredication/
-# hardware.py is in the parent (DeepFake_Predication/)
+# evaluate_dataset.py is in ImageDetection/
+# hardware.py is in the parent (DeepFake_Detection/)
 # ensemble.py is in the same folder
 _HERE       = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_HERE)
