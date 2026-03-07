@@ -24,7 +24,6 @@ Public API
 import os
 import warnings
 import threading
-import sys
 import torch
 from PIL import Image
 from transformers import (
@@ -35,19 +34,9 @@ from transformers import (
 
 warnings.filterwarnings("ignore", message=".*fast processor.*")
 
-# ── Path setup ─────────────────────────────────────────────────────────────────
-# models.py is in ImagePredication/ — hardware.py is in the parent folder
-_HERE       = os.path.dirname(os.path.abspath(__file__))
-_PARENT_DIR = os.path.dirname(_HERE)
-if _PARENT_DIR not in sys.path:
-    sys.path.insert(0, _PARENT_DIR)
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-import hardware
-
-# ── Hardware config ────────────────────────────────────────────────────────────
-hardware.configure()
+# ── Simple hardware detection ──────────────────────────────────────────────────
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 
 # ── Model paths ────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -69,35 +58,32 @@ for _tmp in [
 
 def _load_and_optimize(model: torch.nn.Module) -> torch.nn.Module:
     """
-    Apply the right optimization strategy based on detected hardware profile.
-      CUDA → move to GPU + cast to float16/bfloat16 (Tensor Cores)
+    Apply the right optimization strategy based on detected hardware.
+      CUDA → move to GPU + cast to float16 (Tensor Cores)
       CPU  → stay float32, just call eval()
-    Note: INT8 quantization is NOT applied — torchao quantized tensors lack
-    autograd support, which breaks the feedback fine-tuning pipeline.
     """
     model.eval()
-    if hardware.PROFILE == "cuda":
-        model = hardware.move_model(model)
-    # CPU: float32, no quantization
+    if torch.cuda.is_available():
+        model = model.to(DEVICE).to(DTYPE)
     return model
 
 
 # ── Load ViT ───────────────────────────────────────────────────────────────────
-print(f"[models.py] Loading ViT  (profile={hardware.PROFILE}) ...", flush=True)
+print(f"[models.py] Loading ViT (device={DEVICE}) ...", flush=True)
 _vit_processor = AutoImageProcessor.from_pretrained(VIT_PATH, use_fast=False)
 _vit_model = ViTForImageClassification.from_pretrained(
     VIT_PATH,
-    torch_dtype=hardware.DTYPE if hardware.PROFILE == "cuda" else torch.float32,
+    torch_dtype=DTYPE,
 )
 _vit_model = _load_and_optimize(_vit_model)
 print("[models.py] ViT ready.", flush=True)
 
 # ── Load SigLIP ────────────────────────────────────────────────────────────────
-print(f"[models.py] Loading SigLIP (profile={hardware.PROFILE}) ...", flush=True)
+print(f"[models.py] Loading SigLIP (device={DEVICE}) ...", flush=True)
 _siglip_processor = AutoImageProcessor.from_pretrained(SIGLIP_PATH, use_fast=False)
 _siglip_model = SiglipForImageClassification.from_pretrained(
     SIGLIP_PATH,
-    torch_dtype=hardware.DTYPE if hardware.PROFILE == "cuda" else torch.float32,
+    torch_dtype=DTYPE,
 )
 _siglip_model = _load_and_optimize(_siglip_model)
 print("[models.py] SigLIP ready.", flush=True)
@@ -119,7 +105,7 @@ def predict_vit(image: Image.Image) -> tuple[float, float]:
     """
     img    = image.convert("RGB")
     inputs = _vit_processor(images=img, return_tensors="pt")
-    inputs = {k: v.to(hardware.DEVICE) for k, v in inputs.items()}
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
     with torch.inference_mode():
         logits = _vit_model(**inputs).logits
@@ -136,7 +122,7 @@ def predict_siglip(image: Image.Image) -> tuple[float, float]:
     """
     img    = image.convert("RGB")
     inputs = _siglip_processor(images=img, return_tensors="pt")
-    inputs = {k: v.to(hardware.DEVICE) for k, v in inputs.items()}
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
     with torch.inference_mode():
         logits = _siglip_model(**inputs).logits

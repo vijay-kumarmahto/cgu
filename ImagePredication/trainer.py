@@ -61,7 +61,7 @@ from PIL import Image
 from safetensors.torch import save_file, load_file
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
-# trainer.py is in ImagePredication/ — hardware.py is in the parent folder
+# trainer.py is in ImagePredication/
 _HERE       = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_HERE)
 if _PARENT_DIR not in sys.path:
@@ -69,7 +69,9 @@ if _PARENT_DIR not in sys.path:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import hardware
+# ── Simple hardware detection ──────────────────────────────────────────────────
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 import feedback_store
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -235,7 +237,7 @@ def restore_from_backup() -> bool:
             success = False
             continue
         try:
-            state = load_file(backup_path, device=str(hardware.DEVICE))
+            state = load_file(backup_path, device=str(DEVICE))
             model.load_state_dict(state)
             model.eval()
             print(f"[trainer] {name}: restored from backup", flush=True)
@@ -279,8 +281,8 @@ def _fine_tune(
             img    = item["image"].convert("RGB")
             label  = item["label"]
             inputs = processor(images=img, return_tensors="pt")
-            inputs = {k: v.to(hardware.DEVICE) for k, v in inputs.items()}
-            target = torch.tensor([label_fn(label)], dtype=torch.long).to(hardware.DEVICE)
+            inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+            target = torch.tensor([label_fn(label)], dtype=torch.long).to(DEVICE)
 
             logits     = model(**inputs).logits
             ce_loss    = F.cross_entropy(logits.float(), target)
@@ -480,4 +482,5 @@ def train_on_correction(image: Image.Image, correct_label: str) -> dict:
             "siglip_steps": siglip_steps,
             "drift_check":  ran_drift,
             "rollback":     drift_result["triggered"],
+            "correction_num": n,
         }

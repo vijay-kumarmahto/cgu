@@ -18,7 +18,7 @@ env/
 .venv
 
 # Model snapshots & weights
-models/
+
 *.safetensors
 *.pt
 *.pth

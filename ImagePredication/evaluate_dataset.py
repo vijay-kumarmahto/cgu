@@ -36,12 +36,12 @@ if _PARENT_DIR not in sys.path:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-# ── Hardware setup: suppress noise, configure torch, then load the rest ────────
-import hardware
-hardware.suppress_torchao_noise()
-hardware.configure()
-
+import torch
 import ensemble
+
+# ── Simple hardware detection ──────────────────────────────────────────────────
+_DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+_PROFILE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 DATASET_ROOT = os.path.expanduser("~/Downloads/DEEPFAKE_images/Dataset/Test")
@@ -52,7 +52,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 LIMIT = 1000
 
 # Batch size: CPU gets 4, GPU gets 16
-BATCH_SIZE = 16 if hardware.PROFILE == "cuda" else 4
+BATCH_SIZE = 16 if _PROFILE == "cuda" else 4
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")
 FAKE_DIR   = os.path.join(DATASET_ROOT, "Fake")
@@ -157,12 +157,12 @@ def evaluate_folder(folder: str, ground_truth: str, csv_path: str) -> tuple[floa
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    hardware.summary()
     print("=" * 65)
     print("  Ensemble Deepfake Detector — Dataset Evaluation")
     print(f"  Dataset    : {DATASET_ROOT}")
+    print(f"  Device     : {_DEVICE}")
     print(f"  Limit      : {LIMIT if LIMIT else 'ALL'}")
-    print(f"  Batch size : {BATCH_SIZE}  (profile={hardware.PROFILE})")
+    print(f"  Batch size : {BATCH_SIZE}  (profile={_PROFILE})")
     print(f"  Threshold  : {ensemble.CONFIDENCE_THRESHOLD}")
     print(f"  Output     : {OUTPUT_DIR}")
     print("=" * 65)

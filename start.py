@@ -23,15 +23,21 @@ import signal
 import subprocess
 import time
 
-# ── Suppress torchao C-level stderr noise BEFORE any import of torchao ────────
-# Import hardware first (no heavy deps) so we can use the shared utility.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hardware
-hardware.suppress_torchao_noise()
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── 0. Kill any existing app instances ────────────────────────────────────────
+# ── 0. Check virtual environment ─────────────────────────────────────────────
+def check_venv() -> bool:
+    if sys.prefix == sys.base_prefix:
+        print("  ❌  Virtual environment not active.")
+        print("\n  Activate it with:\n")
+        print("  source .venv/bin/activate   # Linux/macOS")
+        print("  .venv\\Scripts\\activate      # Windows\n")
+        return False
+    print("  ✅  Virtual environment active.")
+    return True
+
+
+# ── 1. Kill any existing app instances ────────────────────────────────────────
 def kill_existing() -> None:
     """
     Kill any running/suspended instances of app.py.
@@ -73,7 +79,7 @@ def kill_existing() -> None:
         pass   # non-critical
 
 
-# ── 1. Dependency check ────────────────────────────────────────────────────────
+# ── 2. Dependency check ────────────────────────────────────────────────────────
 REQUIRED_PACKAGES = {
     "torch":           "torch>=2.0.0",
     "torchvision":     "torchvision>=0.15.0",
@@ -84,6 +90,9 @@ REQUIRED_PACKAGES = {
     "tqdm":            "tqdm>=4.65.0",
     "accelerate":      "accelerate>=0.20.0",
     "psutil":          "psutil>=5.9.0",
+    "safetensors":     "safetensors>=0.4.0",
+    "timm":            "timm>=0.9.0",
+    "decord":          "decord>=0.6.0",
 }
 
 def check_dependencies() -> bool:
@@ -106,7 +115,7 @@ def check_dependencies() -> bool:
     return True
 
 
-# ── 2. Model file check ────────────────────────────────────────────────────────
+# ── 3. Model file check ────────────────────────────────────────────────────────
 REQUIRED_MODEL_FILES = [
     "config.json",
     "model.safetensors",
@@ -114,15 +123,22 @@ REQUIRED_MODEL_FILES = [
 ]
 
 IMAGE_DIR = os.path.join(BASE_DIR, "ImagePredication")
+VIDEO_DIR = os.path.join(BASE_DIR, "VideoPredication")
 
 MODEL_DIRS = {
     "ViT":    os.path.join(IMAGE_DIR, "models", "vit"),
     "SigLIP": os.path.join(IMAGE_DIR, "models", "siglip"),
 }
 
+VIDEO_WEIGHTS = {
+    "GenConViT-ED":  os.path.join(VIDEO_DIR, "weights", "genconvit_ed_inference.pth"),
+    "GenConViT-VAE": os.path.join(VIDEO_DIR, "weights", "genconvit_vae_inference.pth"),
+}
+
 def check_models() -> bool:
     all_ok = True
 
+    # Check image models
     for name, path in MODEL_DIRS.items():
         if not os.path.isdir(path):
             print(f"  ❌  {name} model directory missing: {path}")
@@ -141,13 +157,25 @@ def check_models() -> bool:
             print(f"    {name}: {path}/")
             for f in REQUIRED_MODEL_FILES:
                 print(f"      └── {f}")
-        return False
+    else:
+        print("  ✅  All image model files present.")
+    
+    # Check video model weights (optional - warn but don't fail)
+    video_ok = True
+    for name, path in VIDEO_WEIGHTS.items():
+        if not os.path.isfile(path):
+            print(f"  ⚠️  {name} weight missing: {path}")
+            video_ok = False
+    
+    if video_ok:
+        print("  ✅  All video model weights present.")
+    else:
+        print("  ⚠️  Video analysis will be unavailable (weights missing).")
+    
+    return all_ok
 
-    print("  ✅  All model files present.")
-    return True
 
-
-# ── 3. Launch ──────────────────────────────────────────────────────────────────
+# ── 4. Launch ──────────────────────────────────────────────────────────────────
 def launch() -> None:
     app_path = os.path.join(BASE_DIR, "app.py")
     env = os.environ.copy()
@@ -171,7 +199,12 @@ if __name__ == "__main__":
     print("  Ensemble Deepfake Detector — Startup Check")
     print("=" * 60)
 
-    kill_existing()        # ← kill old processes first
+    venv_ok = check_venv()
+    if not venv_ok:
+        print("\n  ❌  Activate virtual environment first.")
+        sys.exit(1)
+
+    kill_existing()
 
     deps_ok   = check_dependencies()
     models_ok = check_models()
