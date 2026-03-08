@@ -54,15 +54,25 @@ video_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(video_module)
 _video_predict = video_module.predict_video
 
-# Load audio inference
+# Load audio inference (which also sets up trainer)
 audio_inference_path = os.path.join(_AUDIO_DIR, "inference.py")
 spec = importlib.util.spec_from_file_location("audio_inference", audio_inference_path)
 audio_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(audio_module)
 _audio_analyze = audio_module.analyze_audio
 
-# Pre-populate replay buffer from previously saved corrections on disk
+# Get the trainer that was already injected in inference.py
+audio_trainer_module = audio_module._audio_trainer
+
+# Load audio feedback store
+audio_feedback_path = os.path.join(_AUDIO_DIR, "feedback_store.py")
+spec = importlib.util.spec_from_file_location("audio_feedback", audio_feedback_path)
+audio_feedback_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(audio_feedback_module)
+
+# Pre-populate replay buffers from previously saved corrections on disk
 feedback_store.load_buffer_from_disk()
+audio_feedback_module.load_buffer_from_disk()
 
 # ── Session state ──────────────────────────────────────────────────────────────
 _last = {
@@ -83,12 +93,22 @@ _last_audio = {
     "real_prob": None,
 }
 
+# Training state tracking (image)
+_training_in_progress = threading.Event()  # Set when training starts, cleared when done
+_last_training_result = None  # Cache last result so it can be shown multiple times
+
+# Training state tracking (audio)
+_audio_training_in_progress = threading.Event()
+_last_audio_training_result = None
+
 # Queue used to pass training result from background thread → UI poll
 # maxsize=1 — only the latest result matters
 _train_result_queue: queue.Queue = queue.Queue(maxsize=1)
+_audio_train_result_queue: queue.Queue = queue.Queue(maxsize=1)
 
 # Queue for live training progress updates
 _train_progress_queue: queue.Queue = queue.Queue()
+_audio_train_progress_queue: queue.Queue = queue.Queue()
 
 
 # ── Feedback: correct ─────────────────────────────────────────────────────────
@@ -104,6 +124,8 @@ def feedback_correct():
 
 # ── Feedback: wrong — triggers background fine-tuning ─────────────────────────
 def feedback_wrong():
+    global _last_training_result
+    
     if _last["image"] is None or _last["verdict"] is None:
         return "⚠️ No prediction yet — upload and detect first."
 
@@ -112,6 +134,13 @@ def feedback_wrong():
 
     # Record correction → auto-flips label, saves image, updates buffer
     correct_label = feedback_store.record_correction(image, predicted_label)
+    
+    # Capture correction number BEFORE spawning thread to avoid race condition
+    correction_num = feedback_store.correction_count()
+    total = feedback_store.total_logged()
+
+    # Clear last result since new training is starting
+    _last_training_result = None
 
     # Drain any stale result from previous training so queue is clean
     try:
@@ -126,22 +155,26 @@ def feedback_wrong():
         except queue.Empty:
             break
 
+    # Set training flag
+    _training_in_progress.set()
+
     # Launch fine-tuning in a background thread so UI stays responsive
     def _train():
-        correction_num = feedback_store.correction_count()
-        _train_progress_queue.put(f"🔄 **Training correction #{correction_num}...**")
-        
-        res = trainer.train_on_correction(image, correct_label)
-        
         try:
-            _train_result_queue.put_nowait(res)
-        except queue.Full:
-            pass   # already a newer result waiting
+            _train_progress_queue.put(f"🔄 **Training correction #{correction_num}...**")
+            
+            res = trainer.train_on_correction(image, correct_label)
+            
+            try:
+                _train_result_queue.put_nowait(res)
+            except queue.Full:
+                pass   # already a newer result waiting
+        finally:
+            # Clear training flag when done
+            _training_in_progress.clear()
 
     threading.Thread(target=_train, daemon=True).start()
 
-    total = feedback_store.total_logged()
-    correction_num = feedback_store.correction_count()
     return (
         f"❌ **Wrong prediction recorded.**\n\n"
         f"- Model said: **{predicted_label}** → Correct label: **{correct_label}**\n"
@@ -158,16 +191,33 @@ def check_training_status():
     Reads the result that the background training thread posted to the queue.
     Non-blocking — returns immediately whether training is done or still running.
     """
+    global _last_training_result
+    
+    # If we have a cached result, return it (allows multiple clicks after completion)
+    if _last_training_result is not None:
+        return _last_training_result
+    
+    # Try to get new result from queue
     try:
         res = _train_result_queue.get_nowait()
+        # Cache the result
+        _last_training_result = _format_training_result(res)
+        return _last_training_result
     except queue.Empty:
         # Check for progress updates
         try:
             progress = _train_progress_queue.get_nowait()
             return progress + "\n\n⏳ **Training still in progress** — check again in a few seconds."
         except queue.Empty:
-            return "⏳ **Training still in progress** — check again in a few seconds."
+            # No result and no progress - check if training is actually running
+            if _training_in_progress.is_set():
+                return "⏳ **Training still in progress** — check again in a few seconds."
+            else:
+                return "ℹ️ **No training in progress.**\n\nClick ❌ Wrong on a prediction to start training."
 
+
+def _format_training_result(res: dict) -> str:
+    """Format training result for display."""
     vit_steps    = res.get("vit_steps", 0)
     siglip_steps = res.get("siglip_steps", 0)
     rollback     = res.get("rollback", False)
@@ -233,6 +283,15 @@ with gr.Blocks(title="Ensemble Deepfake Detector") as demo:
                 if image is None:
                     return "⚠️ No image uploaded.", {}, {}, {}
                 
+                # Check if training is in progress
+                if _training_in_progress.is_set():
+                    return (
+                        "🔒 **Model is locked — training in progress.**\n\n"
+                        "Please wait for training to complete before running detection.\n\n"
+                        "Click **🔄 Check Training Status** to see progress.",
+                        {"Locked": 1.0}, {"Locked": 1.0}, {"Locked": 1.0}
+                    )
+                
                 try:
                     pil_image = Image.fromarray(image).convert("RGB")
                     result    = ensemble.run(pil_image)
@@ -244,21 +303,21 @@ with gr.Blocks(title="Ensemble Deepfake Detector") as demo:
                 _last["verdict"] = result["verdict"]
 
                 vit_output = {
-                    "Fake": round(result["vit_fake"], 4),
                     "Real": round(result["vit_real"], 4),
+                    "Fake": round(result["vit_fake"], 4),
                 }
 
                 if result["path"] == "full_ensemble":
                     siglip_output = {
-                        "Fake": round(result["siglip_fake"], 4),
                         "Real": round(result["siglip_real"], 4),
+                        "Fake": round(result["siglip_fake"], 4),
                     }
                 else:
                     siglip_output = {"(not used — ViT was confident)": 1.0}
 
                 final_output = {
-                    "Fake": round(result["fake_prob"], 4),
                     "Real": round(result["real_prob"], 4),
+                    "Fake": round(result["fake_prob"], 4),
                 }
 
                 return "", vit_output, siglip_output, final_output
@@ -389,6 +448,15 @@ with gr.Blocks(title="Ensemble Deepfake Detector") as demo:
                 if audio_path is None:
                     return "⚠️ No audio uploaded.", {}
                 
+                # Check if training is in progress
+                if _audio_training_in_progress.is_set():
+                    return (
+                        "🔒 **Model is locked — training in progress.**\n\n"
+                        "Please wait for training to complete before running detection.\n\n"
+                        "Click **🔄 Check Training Status** to see progress.",
+                        {"Locked": 1.0}
+                    )
+                
                 try:
                     result = _audio_analyze(audio_path)
                     
@@ -428,12 +496,99 @@ with gr.Blocks(title="Ensemble Deepfake Detector") as demo:
             def audio_feedback_correct():
                 if _last_audio["verdict"] is None:
                     return "⚠️ No prediction yet — upload and detect first."
-                return f"✅ **Prediction was correct — no training needed.**\n\nVerdict: {_last_audio['verdict']}"
+                count = audio_feedback_module.correction_count()
+                return f"✅ **Prediction was correct — no training needed.**\n\nVerdict: {_last_audio['verdict']}\nSession corrections: {count}"
             
             def audio_feedback_wrong():
-                if _last_audio["verdict"] is None:
+                global _last_audio_training_result
+                
+                if _last_audio["path"] is None or _last_audio["verdict"] is None:
                     return "⚠️ No prediction yet — upload and detect first."
-                return f"❌ **Wrong prediction recorded.**\n\n⚠️ Audio model fine-tuning not yet implemented.\n\nPredicted: {_last_audio['verdict']}"
+                
+                audio_path = _last_audio["path"]
+                predicted_label = _last_audio["verdict"]
+                
+                print(f"[app.py] Audio feedback wrong triggered: {audio_path}, {predicted_label}", flush=True)
+                
+                # Record correction
+                correct_label = audio_feedback_module.record_correction(audio_path, predicted_label)
+                correction_num = audio_feedback_module.correction_count()
+                total = audio_feedback_module.total_logged()
+                
+                print(f"[app.py] Correction recorded: #{correction_num}, correct_label={correct_label}", flush=True)
+                
+                # Clear last result
+                _last_audio_training_result = None
+                
+                # Drain queues
+                try:
+                    _audio_train_result_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                
+                while not _audio_train_progress_queue.empty():
+                    try:
+                        _audio_train_progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                
+                # Set training flag
+                _audio_training_in_progress.set()
+                
+                print(f"[app.py] Starting training thread...", flush=True)
+                
+                # Launch training in background
+                def _train():
+                    try:
+                        print(f"[app.py] Training thread started", flush=True)
+                        _audio_train_progress_queue.put(f"🔄 **Training correction #{correction_num}...**")
+                        res = audio_trainer_module.train_on_correction(audio_path, correct_label)
+                        print(f"[app.py] Training completed: {res}", flush=True)
+                        try:
+                            _audio_train_result_queue.put_nowait(res)
+                        except queue.Full:
+                            pass
+                    except Exception as e:
+                        print(f"[app.py] Training error: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                    finally:
+                        _audio_training_in_progress.clear()
+                
+                threading.Thread(target=_train, daemon=True).start()
+                
+                return (
+                    f"❌ **Wrong prediction recorded.**\n\n"
+                    f"- Model said: **{predicted_label}** → Correct label: **{correct_label}**\n"
+                    f"- 🔄 Training correction **#{correction_num}** in background...\n"
+                    f"- Total corrections logged: **{total}**\n\n"
+                    f"_Click **🔄 Check Training Status** below when ready._"
+                )
+            
+            def audio_check_training_status():
+                global _last_audio_training_result
+                
+                if _last_audio_training_result is not None:
+                    return _last_audio_training_result
+                
+                try:
+                    res = _audio_train_result_queue.get_nowait()
+                    steps = res.get("steps", 0)
+                    correction_num = res.get("correction_num", "?")
+                    _last_audio_training_result = (
+                        f"✅ **Correction #{correction_num} training complete!**\n\n"
+                        f"- Wav2Vec2: {steps} gradient step(s)"
+                    )
+                    return _last_audio_training_result
+                except queue.Empty:
+                    try:
+                        progress = _audio_train_progress_queue.get_nowait()
+                        return progress + "\n\n⏳ **Training still in progress** — check again in a few seconds."
+                    except queue.Empty:
+                        if _audio_training_in_progress.is_set():
+                            return "⏳ **Training still in progress** — check again in a few seconds."
+                        else:
+                            return "ℹ️ **No training in progress.**\n\nClick ❌ Wrong on a prediction to start training."
             
             audio_correct_btn.click(
                 fn=audio_feedback_correct,
@@ -448,7 +603,7 @@ with gr.Blocks(title="Ensemble Deepfake Detector") as demo:
             )
 
             audio_status_btn.click(
-                fn=lambda: "⚠️ Audio model training not yet implemented.",
+                fn=audio_check_training_status,
                 inputs=[],
                 outputs=[audio_feedback_status],
             )

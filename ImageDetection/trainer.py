@@ -55,6 +55,7 @@ import shutil
 import random
 import threading
 import sys
+import hashlib
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -92,6 +93,7 @@ _vit_model        = None
 _vit_processor    = None
 _siglip_model     = None
 _siglip_processor = None
+_model_lock       = None
 
 # ── Original weights snapshot ─────────────────────────────────────────────────
 _vit_original_head    = None
@@ -101,19 +103,17 @@ _siglip_original_head = None
 _baseline_vit_acc    = None
 _baseline_siglip_acc = None
 
-# ── Thread lock ────────────────────────────────────────────────────────────────
-_train_lock = threading.Lock()
-
 
 # ── Injection ─────────────────────────────────────────────────────────────────
-def set_models(vit_model, vit_processor, siglip_model, siglip_processor) -> None:
-    global _vit_model, _vit_processor, _siglip_model, _siglip_processor
+def set_models(vit_model, vit_processor, siglip_model, siglip_processor, model_lock) -> None:
+    global _vit_model, _vit_processor, _siglip_model, _siglip_processor, _model_lock
     global _vit_original_head, _siglip_original_head
 
     _vit_model        = vit_model
     _vit_processor    = vit_processor
     _siglip_model     = siglip_model
     _siglip_processor = siglip_processor
+    _model_lock       = model_lock
 
     def _snapshot_head(model):
         return {
@@ -145,7 +145,7 @@ def _set_head_only(model: torch.nn.Module) -> None:
 
 # ── L2 anchor loss ─────────────────────────────────────────────────────────────
 def _l2_anchor_loss(model: torch.nn.Module, original_head: dict) -> torch.Tensor:
-    loss = torch.tensor(0.0)
+    loss = torch.tensor(0.0, device=DEVICE)
     for name, param in model.named_parameters():
         if name in original_head:
             orig = original_head[name].to(param.device)
@@ -157,14 +157,14 @@ def _l2_anchor_loss(model: torch.nn.Module, original_head: dict) -> torch.Tensor
 def _get_training_params(buffer_size: int) -> dict:
     """
     Scale training intensity with replay buffer size.
-      0       → only 1 new image; minimal update
-      1–3     → small sample; cautious
+      0–1     → skip training (not enough data)
+      2–3     → small sample; cautious
       4–9     → reasonable sample; normal
       10+     → full sample; standard
     """
-    if buffer_size == 0:
-        return {"max_steps": 2, "min_steps": 1, "lr": 5e-5,
-                "note": "no replay buffer — minimal update"}
+    if buffer_size <= 1:
+        return {"max_steps": 0, "min_steps": 0, "lr": 0,
+                "note": "insufficient data — skipping training"}
     elif buffer_size <= 3:
         return {"max_steps": 3, "min_steps": 2, "lr": 7e-5,
                 "note": f"small buffer ({buffer_size}) — cautious update"}
@@ -176,9 +176,20 @@ def _get_training_params(buffer_size: int) -> dict:
 
 # ── Build batch ────────────────────────────────────────────────────────────────
 def _build_batch(new_image: Image.Image, correct_label: str) -> list[dict]:
-    batch  = [{"image": new_image, "label": correct_label}]
+    # Get replay samples (may include the new image if buffer already has it)
     replay = feedback_store.get_replay_batch(REPLAY_BATCH_SIZE)
-    batch.extend(replay)
+    
+    # Check if new image is already in replay batch (by comparing image data)
+    new_hash = hashlib.md5(new_image.tobytes()).hexdigest()
+    replay_hashes = {hashlib.md5(item["image"].tobytes()).hexdigest() for item in replay}
+    
+    # Only add new image explicitly if it's not in replay batch
+    if new_hash not in replay_hashes:
+        batch = [{"image": new_image, "label": correct_label}]
+        batch.extend(replay)
+    else:
+        batch = replay
+    
     random.shuffle(batch)
     return batch
 
@@ -261,61 +272,68 @@ def _fine_tune(
     min_steps: int,
 ) -> int:
     """Fine-tune classifier head. Returns steps taken."""
-    _set_head_only(model)
-    model.train()
-
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    if not trainable:
-        print(f"[trainer] {model_name}: no trainable params — skipping.", flush=True)
+    if max_steps == 0:
         return 0
+    
+    _set_head_only(model)
+    
+    try:
+        model.train()
 
-    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        if not trainable:
+            print(f"[trainer] {model_name}: no trainable params — skipping.", flush=True)
+            return 0
 
-    steps_done = 0
-    loss_val   = 0.0
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
 
-    for step in range(max_steps):
-        total_loss = torch.tensor(0.0)
+        steps_done = 0
+        loss_val   = 0.0
 
-        for item in batch:
-            img    = item["image"].convert("RGB")
-            label  = item["label"]
-            inputs = processor(images=img, return_tensors="pt")
-            inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-            target = torch.tensor([label_fn(label)], dtype=torch.long).to(DEVICE)
+        for step in range(max_steps):
+            total_loss = torch.tensor(0.0, device=DEVICE)
 
-            logits     = model(**inputs).logits
-            ce_loss    = F.cross_entropy(logits.float(), target)
-            total_loss = total_loss + ce_loss
+            for item in batch:
+                img    = item["image"].convert("RGB")
+                label  = item["label"]
+                inputs = processor(images=img, return_tensors="pt")
+                inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                target = torch.tensor([label_fn(label)], dtype=torch.long).to(DEVICE)
 
-        total_loss = total_loss + _l2_anchor_loss(model, original_head)
+                logits     = model(**inputs).logits
+                ce_loss    = F.cross_entropy(logits.float(), target)
+                total_loss = total_loss + ce_loss
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+            total_loss = total_loss + _l2_anchor_loss(model, original_head)
 
-        steps_done += 1
-        loss_val    = total_loss.item()
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
 
-        print(
-            f"[trainer] {model_name}: step {step+1}/{max_steps}  loss={loss_val:.4f}",
-            flush=True,
-        )
+            steps_done += 1
+            loss_val    = total_loss.item()
 
-        if step >= min_steps - 1 and loss_val < EARLY_STOP_LOSS:
             print(
-                f"[trainer] {model_name}: early stop at step {step+1} "
-                f"(loss={loss_val:.4f} < {EARLY_STOP_LOSS})",
+                f"[trainer] {model_name}: step {step+1}/{max_steps}  loss={loss_val:.4f}",
                 flush=True,
             )
-            break
 
-    model.eval()
-    print(
-        f"[trainer] {model_name}: done — {steps_done} step(s), final loss={loss_val:.4f}",
-        flush=True,
-    )
-    return steps_done
+            if step >= min_steps - 1 and loss_val < EARLY_STOP_LOSS:
+                print(
+                    f"[trainer] {model_name}: early stop at step {step+1} "
+                    f"(loss={loss_val:.4f} < {EARLY_STOP_LOSS})",
+                    flush=True,
+                )
+                break
+
+        print(
+            f"[trainer] {model_name}: done — {steps_done} step(s), final loss={loss_val:.4f}",
+            flush=True,
+        )
+        return steps_done
+    
+    finally:
+        model.eval()
 
 
 # ── Drift detection ────────────────────────────────────────────────────────────
@@ -411,14 +429,14 @@ def train_on_correction(image: Image.Image, correct_label: str) -> dict:
     -------
     {"vit_steps": int, "siglip_steps": int, "drift_check": bool, "rollback": bool}
     """
-    if _vit_model is None or _siglip_model is None:
+    if _vit_model is None or _siglip_model is None or _model_lock is None:
         print("[trainer] Models not injected — call set_models() first.", flush=True)
         return {"vit_steps": 0, "siglip_steps": 0, "drift_check": False, "rollback": False}
 
-    with _train_lock:
+    with _model_lock:
         # Buffer size AFTER this correction was already added by record_correction
         buf_size     = feedback_store.buffer_size()
-        train_params = _get_training_params(max(0, buf_size - 1))
+        train_params = _get_training_params(buf_size)
         n            = feedback_store.correction_count()
         note_str     = f"  [{train_params['note']}]" if train_params["note"] else ""
 
@@ -464,23 +482,23 @@ def train_on_correction(image: Image.Image, correct_label: str) -> dict:
         except RuntimeError as exc:
             print(f"[trainer] ⚠️  Save error: {exc}", flush=True)
 
-        # Drift check every N corrections
-        drift_result = {"triggered": False, "vit_acc": -1.0, "siglip_acc": -1.0}
-        ran_drift    = False
+    # Drift check every N corrections (OUTSIDE lock to avoid deadlock)
+    drift_result = {"triggered": False, "vit_acc": -1.0, "siglip_acc": -1.0}
+    ran_drift    = False
 
-        if n % DRIFT_CHECK_EVERY == 0:
-            ran_drift    = True
-            drift_result = run_drift_check()
+    if n % DRIFT_CHECK_EVERY == 0:
+        ran_drift    = True
+        drift_result = run_drift_check()
 
-        print(
-            f"[trainer] ── Done ──  ViT: {vit_steps} step(s)  SigLIP: {siglip_steps} step(s)",
-            flush=True,
-        )
+    print(
+        f"[trainer] ── Done ──  ViT: {vit_steps} step(s)  SigLIP: {siglip_steps} step(s)",
+        flush=True,
+    )
 
-        return {
-            "vit_steps":    vit_steps,
-            "siglip_steps": siglip_steps,
-            "drift_check":  ran_drift,
-            "rollback":     drift_result["triggered"],
-            "correction_num": n,
-        }
+    return {
+        "vit_steps":    vit_steps,
+        "siglip_steps": siglip_steps,
+        "drift_check":  ran_drift,
+        "rollback":     drift_result["triggered"],
+        "correction_num": n,
+    }

@@ -16,6 +16,21 @@ _audio_models = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_audio_models)
 predict_audio = _audio_models.predict_audio
 
+# Inject models into trainer
+_trainer_path = os.path.join(_THIS_DIR, 'trainer.py')
+_spec = importlib.util.spec_from_file_location('audio_trainer', _trainer_path)
+_audio_trainer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_audio_trainer)
+_audio_trainer.set_models(
+    _audio_models.get_model(),
+    _audio_models.get_feature_extractor(),
+    _audio_models.get_lock(),
+    _audio_models.DEVICE
+)
+
+# Export for app.py to use
+__all__ = ['analyze_audio', '_audio_trainer']
+
 
 def analyze_audio(audio_path: str) -> dict:
     """

@@ -88,12 +88,13 @@ _siglip_model = SiglipForImageClassification.from_pretrained(
 _siglip_model = _load_and_optimize(_siglip_model)
 print("[models.py] SigLIP ready.", flush=True)
 
+# ── Shared lock for thread safety ─────────────────────────────────────────────
+# Both inference and training must acquire this lock to prevent concurrent access
+_model_lock = threading.Lock()
+
 # ── Register with trainer so fine-tune can access live model references ────────
 import trainer
-trainer.set_models(_vit_model, _vit_processor, _siglip_model, _siglip_processor)
-
-# ── Inference lock (held during predict; training waits on _train_lock) ────────
-_inference_lock = threading.Lock()
+trainer.set_models(_vit_model, _vit_processor, _siglip_model, _siglip_processor, _model_lock)
 
 
 # ── Public inference functions ─────────────────────────────────────────────────
@@ -107,9 +108,20 @@ def predict_vit(image: Image.Image) -> tuple[float, float]:
     inputs = _vit_processor(images=img, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
-    with torch.inference_mode():
-        logits = _vit_model(**inputs).logits
-        probs  = torch.nn.functional.softmax(logits.float(), dim=1).squeeze().tolist()
+    with _model_lock:
+        with torch.inference_mode():
+            logits = _vit_model(**inputs).logits
+            probs  = torch.nn.functional.softmax(logits.float(), dim=1)
+            
+            # Handle batch dimension
+            if probs.dim() > 1:
+                probs = probs.squeeze(0)
+            
+            probs = probs.tolist()
+            
+            # Validate shape
+            if not isinstance(probs, list) or len(probs) != 2:
+                raise RuntimeError(f"Unexpected probs shape: {probs}")
 
     # ViT: index 0 = Real, index 1 = Fake
     return round(probs[1], 4), round(probs[0], 4)
@@ -124,9 +136,20 @@ def predict_siglip(image: Image.Image) -> tuple[float, float]:
     inputs = _siglip_processor(images=img, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
-    with torch.inference_mode():
-        logits = _siglip_model(**inputs).logits
-        probs  = torch.nn.functional.softmax(logits.float(), dim=1).squeeze().tolist()
+    with _model_lock:
+        with torch.inference_mode():
+            logits = _siglip_model(**inputs).logits
+            probs  = torch.nn.functional.softmax(logits.float(), dim=1)
+            
+            # Handle batch dimension
+            if probs.dim() > 1:
+                probs = probs.squeeze(0)
+            
+            probs = probs.tolist()
+            
+            # Validate shape
+            if not isinstance(probs, list) or len(probs) != 2:
+                raise RuntimeError(f"Unexpected probs shape: {probs}")
 
     # SigLIP: index 0 = Fake, index 1 = Real
     return round(probs[0], 4), round(probs[1], 4)
